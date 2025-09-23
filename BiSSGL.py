@@ -86,20 +86,12 @@ def gradient(side, Y, mu, U, V, A, B, xi):
 
 
 def SSGL(vec, theta, z_momentum, delta, eta, lambda0, lambda1):
-    if linalg.norm(vec) == 0:
-        return vec
+    if linalg.norm(z_momentum) <= delta:
+        return np.zeros(vec.shape)
     else:
-        if linalg.norm(z_momentum) > delta:
-            return (
-                max(
-                    0,
-                    1
-                    - eta
-                    * lambda_star(vec, theta, lambda0, lambda1)
-                    / linalg.norm(vec),
-                )
-                * z_momentum
-            )
+        temp = 1 - eta * lambda_star(vec, theta, lambda0, lambda1) / linalg.norm(z_momentum)
+        if temp > 0:
+            return (temp * z_momentum)
         else:
             return np.zeros(vec.shape)
 
@@ -221,13 +213,15 @@ def optimization(
     # Initialize momentem
     A_lag = A.copy()
     B_lag = B.copy()
+    A_momentum = update_momentum(A, A_lag, 2)
+    B_momentum = update_momentum(B, B_lag, 2)
 
     # Main iteration
     for iter in range(2, max_iter):
         # update A
         A_momentum = update_momentum(A, A_lag, iter)
-        grad_A = gradient("A", Y, mu, U, V, A_momentum, B, xi)
-        tilde_Z = A - eta * grad_A
+        grad_A = gradient("A", Y, mu, U, V, A_momentum, B_momentum, xi)
+        tilde_Z = A_momentum - eta * grad_A
         A_lag = A.copy()
         for i in range(d1):
             A[i, :] = SSGL(
@@ -242,8 +236,8 @@ def optimization(
 
         # update B
         B_momentum = update_momentum(B, B_lag, iter)
-        grad_B = gradient("B", Y, mu, U, V, A, B_momentum, xi)
-        Z = B - eta * grad_B
+        grad_B = gradient("B", Y, mu, U, V, A_momentum, B_momentum, xi)
+        Z = B_momentum - eta * grad_B
         B_lag = B.copy()
         for j in range(d2):
             B[j, :] = SSGL(
@@ -257,7 +251,7 @@ def optimization(
             )
 
         # Update theta and delta
-        if iter % 10 == 0:
+        if iter % 2 == 0:
             tilde_theta = update_theta(A, tilde_alpha, tilde_beta)
             theta = update_theta(B, alpha, beta)
             tilde_delta = np.array(
@@ -280,5 +274,7 @@ def optimization(
         norm_B = linalg.norm(B - B_lag) / (linalg.norm(B_lag) + 1e-8)
         if max(norm_A, norm_B) < tol:
             break
+        
+    print(f"Finished with iterations of {iter}")
 
     return mu, A, B
