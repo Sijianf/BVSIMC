@@ -14,6 +14,7 @@ def group_lasso_density(vec, lambda_):
         2 ** (-size)
         * np.pi ** (-(size - 1) / 2)
         / gamma((size + 1) / 2)
+        * lambda_**size
         * np.exp(-norm * lambda_)
     )
     return density
@@ -50,8 +51,8 @@ def h_function(vec, theta, lambda0, lambda1, eta):
     return h_value
 
 
-def update_delta(vec, theta, lambda0, lambda1, eta):
-    zero_vec = np.zeros(vec.shape)
+def update_delta(size, theta, lambda0, lambda1, eta):
+    zero_vec = np.zeros(size)
     p_star_value = p_star(zero_vec, theta, lambda0, lambda1)
     h_value = h_function(zero_vec, theta, lambda0, lambda1, eta)
     if h_value > 0:
@@ -85,13 +86,13 @@ def gradient(side, Y, mu, U, V, A, B, xi):
     return grad
 
 
-def SSGL(vec, theta, z_momentum, delta, eta, lambda0, lambda1):
-    if linalg.norm(z_momentum) <= delta:
+def SSGL(vec, theta, z, delta, eta, lambda0, lambda1):
+    if linalg.norm(z) <= delta:
         return np.zeros(vec.shape)
     else:
-        temp = 1 - eta * lambda_star(vec, theta, lambda0, lambda1) / linalg.norm(z_momentum)
+        temp = 1 - eta * lambda_star(vec, theta, lambda0, lambda1) / linalg.norm(z)
         if temp > 0:
-            return (temp * z_momentum)
+            return temp * z
         else:
             return np.zeros(vec.shape)
 
@@ -200,15 +201,8 @@ def optimization(
     theta = 0.5
 
     # Initialize delta
-    tilde_delta = np.array(
-        [
-            update_delta(A[i, :], tilde_theta, tilde_lambda0, tilde_lambda1, eta)
-            for i in range(d1)
-        ]
-    )
-    delta = np.array(
-        [update_delta(B[j, :], theta, lambda0, lambda1, eta) for j in range(d2)]
-    )
+    tilde_delta = update_delta(K, tilde_theta, tilde_lambda0, tilde_lambda1, eta)
+    delta = update_delta(K, theta, lambda0, lambda1, eta)
 
     # Initialize momentem
     A_lag = A.copy()
@@ -228,7 +222,7 @@ def optimization(
                 A_momentum[i, :],
                 tilde_theta,
                 tilde_Z[i, :],
-                tilde_delta[i],
+                tilde_delta,
                 eta,
                 tilde_lambda0,
                 tilde_lambda1,
@@ -244,37 +238,30 @@ def optimization(
                 B_momentum[j, :],
                 theta,
                 Z[j, :],
-                delta[j],
+                delta,
                 eta,
                 lambda0,
                 lambda1,
             )
 
         # Update theta and delta
-        if iter % 2 == 0:
+        if iter % 10 == 0:
             tilde_theta = update_theta(A, tilde_alpha, tilde_beta)
             theta = update_theta(B, alpha, beta)
-            tilde_delta = np.array(
-                [
-                    update_delta(
-                        A[i, :], tilde_theta, tilde_lambda0, tilde_lambda1, eta
-                    )
-                    for i in range(d1)
-                ]
+            tilde_delta = update_delta(
+                K, tilde_theta, tilde_lambda0, tilde_lambda1, eta
             )
-            delta = np.array(
-                [update_delta(B[j, :], theta, lambda0, lambda1, eta) for j in range(d2)]
-            )
+            delta = update_delta(K, theta, lambda0, lambda1, eta)
 
         # Update mu
-        mu = update_mu(Y, mu, U, V, A, B, xi)
+        mu = update_mu(Y, mu, U, V, A_momentum, B_momentum, xi)
 
         # check convergence
         norm_A = linalg.norm(A - A_lag) / (linalg.norm(A_lag) + 1e-8)
         norm_B = linalg.norm(B - B_lag) / (linalg.norm(B_lag) + 1e-8)
         if max(norm_A, norm_B) < tol:
             break
-        
+
     print(f"Finished with iterations of {iter}")
 
     return mu, A, B
