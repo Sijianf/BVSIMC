@@ -254,7 +254,7 @@ def optimization(
             delta = update_delta(K, theta, lambda0, lambda1, eta)
 
         # Update mu
-        mu = update_mu(Y, mu, U, V, A_momentum, B_momentum, xi)
+        mu = update_mu(Y, mu, U, V, A_momentum, B_momentum, xi) * 0
 
         # check convergence
         norm_A = linalg.norm(A - A_lag) / (linalg.norm(A_lag) + 1e-8)
