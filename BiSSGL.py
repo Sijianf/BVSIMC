@@ -80,9 +80,9 @@ def get_W(Y, mu, U, V, A, B, xi):
 def gradient(side, Y, mu, U, V, A, B, xi):
     W = get_W(Y, mu, U, V, A, B, xi)
     if side == "A":
-        grad = U.T @ (xi * Y - W) @ V @ B
+        grad = U.T @ (W - xi * Y) @ V @ B
     elif side == "B":
-        grad = V.T @ (xi * Y - W).T @ U @ A
+        grad = V.T @ (W - xi * Y).T @ U @ A
     return grad
 
 
@@ -210,11 +210,32 @@ def optimization(
     A_momentum = update_momentum(A, A_lag, 2)
     B_momentum = update_momentum(B, B_lag, 2)
 
+    # Monitor log likelihood
+    logLik = []
+
     # Main iteration
     for iter in range(2, max_iter):
+        logLik.append(
+            log_likelihood(
+                Y,
+                mu,
+                U,
+                V,
+                A,
+                B,
+                xi,
+                theta,
+                lambda0,
+                lambda1,
+                tilde_theta,
+                tilde_lambda0,
+                tilde_lambda1,
+            )
+        )
         # update A
         A_momentum = update_momentum(A, A_lag, iter)
         grad_A = gradient("A", Y, mu, U, V, A_momentum, B_momentum, xi)
+        print(grad_A[0])
         tilde_Z = A_momentum - eta * grad_A
         A_lag = A.copy()
         for i in range(d1):
@@ -231,6 +252,7 @@ def optimization(
         # update B
         B_momentum = update_momentum(B, B_lag, iter)
         grad_B = gradient("B", Y, mu, U, V, A_momentum, B_momentum, xi)
+        print(grad_B[0])
         Z = B_momentum - eta * grad_B
         B_lag = B.copy()
         for j in range(d2):
@@ -264,4 +286,4 @@ def optimization(
 
     print(f"Finished with iterations of {iter}")
 
-    return mu, A, B
+    return mu, A, B, logLik
