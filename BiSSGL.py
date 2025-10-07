@@ -138,7 +138,7 @@ def update_mu(Y, mu, U, V, A, B, xi):
             mu[i]
             + 4
             / (xi * Y[i, :] + 1 - Y[i, :]).sum()
-            * (xi * Y[i, :] - ((xi * Y[i, :] + 1 - Y[i, :]) * P[i, :])).sum()
+            * (xi * Y[i, :] - (xi * Y[i, :] + 1 - Y[i, :]) * P[i, :]).sum()
         )
     return mu
 
