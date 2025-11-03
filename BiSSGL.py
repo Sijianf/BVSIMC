@@ -1,6 +1,6 @@
 # This is a Python file for binary inductive matrix completion using spike-and-slab group lasso prior.
 # Author: Sijian Fan
-# Date: Sepetember 2025
+# Date: November 03 2025
 
 import numpy as np
 from scipy import linalg
