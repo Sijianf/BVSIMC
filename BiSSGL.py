@@ -235,7 +235,7 @@ def optimization(
         # update A
         A_momentum = update_momentum(A, A_lag, iter)
         grad_A = gradient("A", Y, mu, U, V, A_momentum, B_momentum, xi)
-        print(grad_A[0])
+        # print(grad_A[0])
         tilde_Z = A_momentum - eta * grad_A
         A_lag = A.copy()
         for i in range(d1):
@@ -252,7 +252,7 @@ def optimization(
         # update B
         B_momentum = update_momentum(B, B_lag, iter)
         grad_B = gradient("B", Y, mu, U, V, A_momentum, B_momentum, xi)
-        print(grad_B[0])
+        # print(grad_B[0])
         Z = B_momentum - eta * grad_B
         B_lag = B.copy()
         for j in range(d2):
