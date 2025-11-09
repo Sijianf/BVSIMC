@@ -1,11 +1,3 @@
-.Rproj.user
-.Rbuildignore
-.Rhistory
-.RData
-.Ruserdata
-.gitattributes
-*.Rproj
-src/*.o
-src/*.so
-src/*.dll
 .DS_Store
+
+scripts/methods/SGIMC
