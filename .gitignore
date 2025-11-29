@@ -1,4 +1,8 @@
 .DS_Store
 
 scripts/methods/SGIMC
+scripts/methods/DRIMC
+
+datasets/
+
 references/
