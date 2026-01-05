@@ -1,0 +1,9 @@
+.DS_Store
+
+scripts/methods/SGIMC
+scripts/methods/DRIMC
+scripts/methods/PyDTI3
+
+datasets/realAnalysis
+
+references/
