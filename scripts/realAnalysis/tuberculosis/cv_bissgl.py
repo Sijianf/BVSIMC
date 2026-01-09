@@ -5,14 +5,11 @@
 
 # In[1]:
 
-
 import os
 import time
 import gzip
 import pickle
 import warnings
-
-# import matplotlib.pyplot as plt
 
 import numpy as np
 
@@ -23,8 +20,7 @@ warnings.simplefilter("ignore", TqdmSynchronisationWarning)
 
 # In[2]:
 
-
-PATH_ROOT = "/Users/sijianfan/Documents/projects/BiSSGL"
+PATH_ROOT = "/work/sfan/projects/BiSSGL"
 PATH_DATA = os.path.join(PATH_ROOT, "datasets/realAnalysis/tuberculosis/cv_data")
 
 PATH_OUTPUT = os.path.join(PATH_ROOT, "outputs/realAnalysis/tuberculosis/")
@@ -37,7 +33,6 @@ if not os.path.isdir(PATH_ARCHIVE):
 
 
 # In[3]:
-
 
 filename_staged = os.path.join(PATH_DATA, "staged_dataset.gz")
 
@@ -137,10 +132,10 @@ grid_dataset = ParameterGrid(
 
 grid_model = ParameterGrid(
     {
-        "tilde_lambda0": [1, 3, 5],
-        "lambda0": [1, 3, 5],
-        "xi": [1, 2, 3, 5, 10],
-        "eta": [1e-6, 1e-8],
+        "tilde_lambda0": [1, 3, 5, 10, 50],
+        "lambda0": [1, 3, 5, 10, 50],
+        "xi": [1, 2, 4, 6, 8, 10],
+        "eta": [1e-6, 1e-8, 1e-10],
         "K": [3, 6, 13],
     }
 )
@@ -157,91 +152,34 @@ from scripts.methods.BiSSGL.BiSSGLc import BiSSGL
 
 
 from tqdm import tqdm
-from sklearn.model_selection import ShuffleSplit, KFold
+from sklearn.model_selection import KFold
 from sklearn.model_selection import train_test_split
 from scipy.special import expit
 
-import itertools
-import multiprocessing as mp
-from joblib import Parallel, delayed
-
-
-# --- tune these ---
-N_JOBS = min(max(1, os.cpu_count() - 1), 16)  # adjust as you like
-RANDOM_STATE = random_state  # reuse your existing random_state
-# ---------------------
-
-# try to use forkserver on Linux to reduce forking issues (safe with loky)
-try:
-    mp.set_start_method("forkserver")
-except RuntimeError:
-    # already set or not supported; ok to continue
-    pass
-
-# build task list of (par_dtst, par_mdl)
-tasks = [(par_dtst, par_mdl) for par_dtst in grid_dataset for par_mdl in grid_model]
-
-
-def worker(par_dtst, par_mdl):
-    """Run the original logic for one (dataset-config, model-config) pair.
-    Returns a list of result dicts (one per CV fold)."""
-    local_results = []
-
-    # prepare train indices: same logic as original (take prefix by train_size)
+results = []
+for par_dtst in tqdm(grid_dataset):
+    # prepare the train dataset: take the specified share from the beginnig of the index array
     ind_train_all, _ = train_test_split(
         ind_dvlp,
         shuffle=False,
-        random_state=RANDOM_STATE,
+        random_state=random_state,
         test_size=(1 - (par_dtst["train_size"] / dvlp_size)),
     )
 
-    # full-train on development set (as in your original code)
-    Y_train_full = get_submatrix(Y, ind_train_all)
+    # Run the experiment: the model
+    for par_mdl in grid_model:  # tqdm.tqdm(, desc="cv %02d" % (cv,))
+        Y_train = get_submatrix(Y, ind_train_all)
 
-    xi = par_mdl["xi"]
-    eta = par_mdl["eta"]
-    tilde_lambda0 = par_mdl["tilde_lambda0"]
-    lambda0 = par_mdl["lambda0"]
-    K = par_mdl["K"]
+        # set up the model
+        xi, eta, tilde_lambda0, lambda0, K = (
+            par_mdl["xi"],
+            par_mdl["eta"],
+            par_mdl["tilde_lambda0"],
+            par_mdl["lambda0"],
+            par_mdl["K"],
+        )
 
-    # model on whole development dataset
-    model = BiSSGL(
-        Y=Y_train_full.toarray(),
-        U=U,
-        V=V,
-        xi=xi,
-        eta=eta,
-        tilde_lambda0=tilde_lambda0,
-        tilde_lambda1=1,
-        tilde_alpha=1 / K,
-        tilde_beta=1,
-        lambda0=lambda0,
-        lambda1=1,
-        alpha=1 / K,
-        beta=1,
-        K=K,
-        max_iter=1000,
-        tol=1e-8,
-    )
-    est_mu, est_A, est_B, logLik = model.optimization()
-
-    # test metrics (single, outside CV loop)
-    prob_full = expit(U @ est_A @ est_B.T @ V.T)
-    prob_test = get_submatrix(prob_full, ind_test)
-    scores_test = mc_get_scores(Y_test, prob_test)
-    d1_test = int((abs(est_A).max(axis=1) > 0).sum())
-    d2_test = int((abs(est_B).max(axis=1) > 0).sum())
-
-    # run k-fold CV on ind_train_all
-    splt = KFold(par_dtst["n_splits"], shuffle=True, random_state=RANDOM_STATE)
-    for cv, (ind_train_idx, ind_valid_idx) in enumerate(splt.split(ind_train_all)):
-        ind_train = ind_train_all[ind_train_idx]
-        ind_valid = ind_train_all[ind_valid_idx]
-
-        Y_train = get_submatrix(Y, ind_train)
-        Y_valid = get_submatrix(Y, ind_valid)
-
-        model_cv = BiSSGL(
+        model = BiSSGL(
             Y=Y_train.toarray(),
             U=U,
             V=V,
@@ -259,46 +197,80 @@ def worker(par_dtst, par_mdl):
             max_iter=1000,
             tol=1e-8,
         )
-        est_mu_cv, est_A_cv, est_B_cv, logLik_cv = model_cv.optimization()
 
-        prob_full_cv = expit(U @ est_A_cv @ est_B_cv.T @ V.T)
-        prob_valid = get_submatrix(prob_full_cv, ind_valid)
-        scores_valid = mc_get_scores(Y_valid, prob_valid)
-        d1_valid = int((abs(est_A_cv).max(axis=1) > 0).sum())
-        d2_valid = int((abs(est_B_cv).max(axis=1) > 0).sum())
+        # fit on the whole development dataset
+        est_mu, est_A, est_B, logLik = model.optimization()
 
-        local_results.append(
-            {
-                "train_size": par_dtst["train_size"],
-                "xi": par_mdl["xi"],
-                "eta": par_mdl["eta"],
-                "tilde_lambda0": par_mdl["tilde_lambda0"],
-                "lambda0": par_mdl["lambda0"],
-                "K": par_mdl["K"],
-                "cv": cv,
-                "val_score": scores_valid["auc"],
-                "val_d1": d1_valid,
-                "val_d2": d2_valid,
-                "test_score": scores_test["auc"],
-                "test_d1": d1_test,
-                "test_d2": d2_test,
-            }
-        )
+        # get the score
+        prob_full = expit(U @ est_A @ est_B.T @ V.T)
+        prob_test = get_submatrix(prob_full, ind_test)
+        scores_test = mc_get_scores(Y_test, prob_test)
+        d1_test = sum(abs(est_A).max(axis=1) > 0)
+        d2_test = sum(abs(est_B).max(axis=1) > 0)
 
-    return local_results
+        # run the k-fold CV
+        # splt = ShuffleSplit(**par_dtst, random_state=random_state)
+        splt = KFold(par_dtst["n_splits"], shuffle=True, random_state=random_state)
+        for cv, (ind_train, ind_valid) in enumerate(splt.split(ind_train_all)):
 
+            # prepare the train and test indices
+            ind_train, ind_valid = ind_train_all[ind_train], ind_train_all[ind_valid]
+            Y_train = get_submatrix(Y, ind_train)
+            Y_valid = get_submatrix(Y, ind_valid)
 
-# run in parallel; chunk size reduces pickling overhead
-n_tasks = len(tasks)
-chunksize = max(1, n_tasks // (N_JOBS * 4))
+            # fit the model
+            model = BiSSGL(
+                Y=Y_train.toarray(),
+                U=U,
+                V=V,
+                xi=xi,
+                eta=eta,
+                tilde_lambda0=tilde_lambda0,
+                tilde_lambda1=1,
+                tilde_alpha=1 / K,
+                tilde_beta=1,
+                lambda0=lambda0,
+                lambda1=1,
+                alpha=1 / K,
+                beta=1,
+                K=K,
+                max_iter=1000,
+                tol=1e-8,
+            )
 
-parallel = Parallel(n_jobs=N_JOBS, backend="loky", prefer="processes", verbose=10)
-# produce list of lists, then flatten
-all_results_nested = parallel(
-    delayed(worker)(par_dtst, par_mdl) for (par_dtst, par_mdl) in tasks
-)
-results = [r for sub in all_results_nested for r in sub]
+            # fit on the cv dataset
+            est_mu, est_A, est_B, logLik = model.optimization()
 
-# Save results
+            # compute the class probabilities
+            prob_full = expit(U @ est_A @ est_B.T @ V.T)
+            prob_valid = get_submatrix(prob_full, ind_valid)
+            scores_valid = mc_get_scores(Y_valid, prob_valid)
+            d1_valid = sum(abs(est_A).max(axis=1) > 0)
+            d2_valid = sum(abs(est_B).max(axis=1) > 0)
+
+            # record the results
+            results.append(
+                {
+                    "train_size": par_dtst["train_size"],
+                    "xi": par_mdl["xi"],
+                    "eta": par_mdl["eta"],
+                    "tilde_lambda0": par_mdl["tilde_lambda0"],
+                    "lambda0": par_mdl["lambda0"],
+                    "K": par_mdl["K"],
+                    "cv": cv,
+                    "val_score": scores_valid["auc"],
+                    "val_d1": d1_valid,
+                    "val_d2": d2_valid,
+                    "test_score": scores_test["auc"],
+                    "test_d1": d1_test,
+                    "test_d2": d2_test,
+                }
+            )
+        # end for
+    # end for
+# end for
+
+# Save the results in a pickle
+
 with gzip.open(filename_output, "wb+", 4) as fout:
     pickle.dump(results, fout)
