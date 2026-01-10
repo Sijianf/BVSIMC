@@ -153,7 +153,7 @@ class BiSSGL:
         loglik = (
             np.sum(
                 self.xi * self.Y * M
-                - (self.xi * self.Y + 1 - self.Y) * np.log(1 + np.exp(M))
+                - (self.xi * self.Y + 1 - self.Y) * np.logaddexp(0, M)
             )
             - penalty
         )
