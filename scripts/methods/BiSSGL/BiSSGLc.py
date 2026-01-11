@@ -117,13 +117,22 @@ class BiSSGL:
         else:
             raise ValueError("side must be 'A' or 'B'")
 
+    # def SSGL(self, vec, theta, z, delta, eta, lambda0, lambda1):
+    #     if linalg.norm(z) <= delta:
+    #         return np.zeros(vec.shape)
+    #     temp = 1 - eta * self.lambda_star(vec, theta, lambda0, lambda1) / linalg.norm(z)
+    #     if temp > 0:
+    #         return temp * z
+    #     return np.zeros(vec.shape)
+
     def SSGL(self, vec, theta, z, delta, eta, lambda0, lambda1):
-        if linalg.norm(z) <= delta:
+        if not np.all(np.isfinite(z)):
             return np.zeros(vec.shape)
-        temp = 1 - eta * self.lambda_star(vec, theta, lambda0, lambda1) / linalg.norm(z)
-        if temp > 0:
-            return temp * z
-        return np.zeros(vec.shape)
+        z_norm = linalg.norm(z)
+        if z_norm <= delta:
+            return np.zeros(vec.shape)
+        temp = 1 - eta * self.lambda_star(vec, theta, lambda0, lambda1) / z_norm
+        return temp * z
 
     def log_likelihood(
         self,
