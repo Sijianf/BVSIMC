@@ -60,22 +60,30 @@ class BiSSGL:
     def group_lasso_density(self, vec, lambda_):
         size = len(vec)
         norm = linalg.norm(vec)
-        density = (
-            2 ** (-size)
-            * np.pi ** (-(size - 1) / 2)
-            / gamma((size + 1) / 2)
-            * lambda_**size
-            * np.exp(-norm * lambda_)
+        # density = (
+        #     2 ** (-size)
+        #     * np.pi ** (-(size - 1) / 2)
+        #     / gamma((size + 1) / 2)
+        #     * lambda_**size
+        #     * np.exp(-norm * lambda_)
+        # )
+        log_density = (
+            -size * np.log(2)
+            - (size - 1) / 2 * np.log(np.pi)
+            - np.log(gamma((size + 1) / 2))
+            + size * np.log(lambda_)
+            - lambda_ * norm
         )
+        density = np.exp(log_density)
         return density
 
     def p_star(self, vec, theta, lambda0, lambda1):
         spike = (1 - theta) * self.group_lasso_density(vec, lambda0)
         slab = theta * self.group_lasso_density(vec, lambda1)
         if np.isnan(spike) or np.isnan(slab):
-            return np.nan
+            return 1.0
         if spike + slab == 0:
-            return 0.0
+            return 1.0
         return slab / (spike + slab)
 
     def lambda_star(self, vec, theta, lambda0, lambda1):
@@ -88,6 +96,7 @@ class BiSSGL:
     def h_function(self, vec, theta, lambda0, lambda1, eta):
         p = self.p_star(vec, theta, lambda0, lambda1)
         ls = self.lambda_star(vec, theta, lambda0, lambda1)
+        p = max(p, np.finfo(float).tiny)
         return (ls - lambda1) ** 2 + 2 / eta * np.log(p)
 
     def update_delta(self, size, theta, lambda0, lambda1, eta):
