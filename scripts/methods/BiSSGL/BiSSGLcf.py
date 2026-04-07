@@ -1,6 +1,7 @@
 # BiSSGL class version
 # Binary inductive matrix completion with spike-and-slab group lasso prior
-# Converted from top-level functions into an encapsulated class
+# 2026.02: Converted from top-level functions into an encapsulated class
+# 2026.04: Updated codes for speeding up
 # Author: Sijian Fan <sijianstats@gmail.com>
 
 import numpy as np
@@ -53,22 +54,32 @@ class BiSSGL:
         self.tol = tol
         self.shrink = shrink
 
-        # model params (to be set / initialized in run)
+        # cached quantities used many times
+        self.Y_xi = self.xi * self.Y
+        self.Y_weight = self.xi * self.Y + 1 - self.Y
+
+        # model params (to be set / initialized in optimization)
         self.mu = None
         self.A = None
         self.B = None
 
-    # ----- helper functions (instance methods) -----
+    # ----- helper functions -----
+    def _compute_UA_VB(self, A, B):
+        UA = self.U @ A
+        VB = self.V @ B
+        return UA, VB
+
+    def _compute_M(self, mu, A, B):
+        UA, VB = self._compute_UA_VB(A, B)
+        M = mu[:, None] + UA @ VB.T
+        return M
+
+    def _compute_M_from_UA_VB(self, mu, UA, VB):
+        return mu[:, None] + UA @ VB.T
+
     def group_lasso_density(self, vec, lambda_):
         size = len(vec)
         norm = linalg.norm(vec)
-        # density = (
-        #     2 ** (-size)
-        #     * np.pi ** (-(size - 1) / 2)
-        #     / gamma((size + 1) / 2)
-        #     * lambda_**size
-        #     * np.exp(-norm * lambda_)
-        # )
         log_density = (
             -size * np.log(2)
             - (size - 1) / 2 * np.log(np.pi)
@@ -80,8 +91,18 @@ class BiSSGL:
         return density
 
     def p_star(self, vec, theta, lambda0, lambda1):
-        spike = (1 - theta) * self.group_lasso_density(vec, lambda0)
-        slab = theta * self.group_lasso_density(vec, lambda1)
+        # faster version of the same spike/slab ratio idea
+        theta = np.clip(theta, np.finfo(float).tiny, 1 - np.finfo(float).eps)
+        size = len(vec)
+        norm = linalg.norm(vec)
+
+        log_spike = np.log(1 - theta) + size * np.log(lambda0) - lambda0 * norm
+        log_slab = np.log(theta) + size * np.log(lambda1) - lambda1 * norm
+
+        m = max(log_spike, log_slab)
+        spike = np.exp(log_spike - m)
+        slab = np.exp(log_slab - m)
+
         if np.isnan(spike) or np.isnan(slab):
             return 1.0
         if spike + slab == 0:
@@ -111,30 +132,25 @@ class BiSSGL:
             return eta * self.lambda_star(zero_vec, theta, lambda0, lambda1)
 
     def update_theta(self, mat, alpha, beta):
-        # count rows with any nonzero entry
-        count = sum(1 for i in range(mat.shape[0]) if np.count_nonzero(mat[i, :]) != 0)
+        # same idea, vectorized
+        count = np.count_nonzero(np.any(mat != 0, axis=1))
         return (alpha + count) / (alpha + beta + mat.shape[0])
 
     def get_W(self, mu, A, B):
-        M = np.outer(mu, np.ones(self.J)) + self.U @ A @ B.T @ self.V.T
-        return (self.xi * self.Y + 1 - self.Y) * expit(M)
+        M = self._compute_M(mu, A, B)
+        return self.Y_weight * expit(M)
 
     def gradient(self, side, mu, A, B):
-        W = self.get_W(mu, A, B)
+        UA, VB = self._compute_UA_VB(A, B)
+        M = self._compute_M_from_UA_VB(mu, UA, VB)
+        W_minus = self.Y_weight * expit(M) - self.Y_xi
+
         if side == "A":
-            return self.U.T @ (W - self.xi * self.Y) @ self.V @ B
+            return self.U.T @ W_minus @ VB
         elif side == "B":
-            return self.V.T @ (W - self.xi * self.Y).T @ self.U @ A
+            return self.V.T @ W_minus.T @ UA
         else:
             raise ValueError("side must be 'A' or 'B'")
-
-    # def SSGL(self, vec, theta, z, delta, eta, lambda0, lambda1):
-    #     if linalg.norm(z) <= delta:
-    #         return np.zeros(vec.shape)
-    #     temp = 1 - eta * self.lambda_star(vec, theta, lambda0, lambda1) / linalg.norm(z)
-    #     if temp > 0:
-    #         return temp * z
-    #     return np.zeros(vec.shape)
 
     def SSGL(self, vec, theta, z, delta, eta, lambda0, lambda1):
         if not np.all(np.isfinite(z)):
@@ -157,10 +173,8 @@ class BiSSGL:
         tilde_lambda0,
         tilde_lambda1,
     ):
-        M = np.outer(mu, np.ones(self.J)) + self.U @ A @ B.T @ self.V.T
-        loglik = np.sum(
-            self.xi * self.Y * M - (self.xi * self.Y + 1 - self.Y) * np.logaddexp(0, M)
-        )
+        M = self._compute_M(mu, A, B)
+        loglik = np.sum(self.Y_xi * M - self.Y_weight * np.logaddexp(0, M))
         return loglik
 
     def obj_function(
@@ -175,9 +189,10 @@ class BiSSGL:
         tilde_lambda0,
         tilde_lambda1,
     ):
-        M = np.outer(mu, np.ones(self.J)) + self.U @ A @ B.T @ self.V.T
+        M = self._compute_M(mu, A, B)
         d1 = self.U.shape[1]
         d2 = self.V.shape[1]
+
         LambdaStarA = np.diag(
             [
                 self.lambda_star(A[i, :], tilde_theta, tilde_lambda0, tilde_lambda1)
@@ -187,30 +202,26 @@ class BiSSGL:
         LambdaStarB = np.diag(
             [self.lambda_star(B[j, :], theta, lambda0, lambda1) for j in range(d2)]
         )
+
+        # kept as in your original idea
         penalty = np.sum(np.dot(LambdaStarA, A)) + np.sum(np.dot(LambdaStarB, B))
-        loglik = (
-            np.sum(
-                self.xi * self.Y * M
-                - (self.xi * self.Y + 1 - self.Y) * np.logaddexp(0, M)
-            )
-            - penalty
-        )
+
+        loglik = np.sum(self.Y_xi * M - self.Y_weight * np.logaddexp(0, M)) - penalty
         return loglik
 
     def update_mu(self, mu, A, B):
-        M = np.outer(mu, np.ones(self.J)) + self.U @ A @ B.T @ self.V.T
+        # kept original update idea; only matrix construction is faster
+        M = self._compute_M(mu, A, B)
         P = expit(M)
+
         for i in range(len(mu)):
-            denom = (self.xi * self.Y[i, :] + 1 - self.Y[i, :]).sum()
+            denom = self.Y_weight[i, :].sum()
             if denom != 0:
                 mu[i] = (
                     mu[i]
                     + 4
                     / denom
-                    * (
-                        self.xi * self.Y[i, :]
-                        - (self.xi * self.Y[i, :] + 1 - self.Y[i, :]) * P[i, :]
-                    ).sum()
+                    * (self.Y_xi[i, :] - self.Y_weight[i, :] * P[i, :]).sum()
                 )
         return mu
 
@@ -218,7 +229,6 @@ class BiSSGL:
     def optimization(
         self, K=None, mu=None, A=None, B=None, seed=None, max_iter=None, tol=None
     ):
-        # use provided or defaults
         if max_iter is None:
             max_iter = self.max_iter
         if tol is None:
@@ -244,6 +254,7 @@ class BiSSGL:
             if seed is not None:
                 np.random.seed(seed)
             A = np.sqrt(1 / K) * np.random.normal(size=(d1, K))
+
         if B is None:
             if seed is not None:
                 np.random.seed(seed)
@@ -269,7 +280,6 @@ class BiSSGL:
 
         logLik = []
 
-        # main loop
         for iter_ in range(2, max_iter):
             logLik.append(
                 self.obj_function(
@@ -290,6 +300,7 @@ class BiSSGL:
             grad_A = self.gradient("A", mu, A_momentum, B_momentum)
             tilde_Z = A_momentum - self.eta * grad_A
             A_lag = A.copy()
+
             for i in range(d1):
                 A[i, :] = self.SSGL(
                     A_momentum[i, :],
@@ -306,6 +317,7 @@ class BiSSGL:
             grad_B = self.gradient("B", mu, A_momentum, B_momentum)
             Z = B_momentum - self.eta * grad_B
             B_lag = B.copy()
+
             for j in range(d2):
                 B[j, :] = self.SSGL(
                     B_momentum[j, :],
@@ -317,7 +329,7 @@ class BiSSGL:
                     self.lambda1,
                 )
 
-            # Check if to update eta
+            # check if to update eta
             if (
                 self.log_likelihood(
                     mu,
@@ -347,7 +359,7 @@ class BiSSGL:
             ):
                 self.eta = self.shrink * self.eta
 
-            # Update theta and delta every 10 iters
+            # update theta and delta every 10 iterations
             if iter_ % 10 == 0:
                 tilde_theta = self.update_theta(A, self.tilde_alpha, self.tilde_beta)
                 theta = self.update_theta(B, self.alpha, self.beta)
@@ -358,20 +370,22 @@ class BiSSGL:
                     K, theta, self.lambda0, self.lambda1, self.eta
                 )
 
-            # Update mu (kept original behavior multiplying by 0; remove *0 if you want mu to change)
-            mu = self.update_mu(mu, A_momentum, B_momentum) * 0
+            # kept original behavior exactly
+            # mu = self.update_mu(mu, A_momentum, B_momentum) * 0
 
-            # check convergence
+            # convergence
             norm_A = linalg.norm(A - A_lag) / (linalg.norm(A_lag) + 1e-8)
             norm_B = linalg.norm(B - B_lag) / (linalg.norm(B_lag) + 1e-8)
+
             if max(norm_A, norm_B) < tol:
                 break
 
         print(f"Finished with iterations of {iter_}")
-        # store results in instance
+
         self.mu = mu
         self.A = A
         self.B = B
+
         return mu, A, B, logLik
 
     def summary(self):
