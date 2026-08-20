@@ -6,7 +6,7 @@ Import into a notebook or script; nothing runs at import time.
 
 No ground-truth feature set exists for real data, so there are no
 selection *metrics* (recall/precision vs known features). Selection
-*stability* across folds is analyzed instead in utils_selection.py.
+*stability* across folds is analyzed instead via get_feature_frequency().
 
 Typical usage
 -------------
@@ -657,6 +657,474 @@ def print_summary(results, method_label="Method"):
     else:
         print(f"  {'d2 (mean)':>12s}:  {d2_total:.1f}")
     print(f"{'=' * 60}\n")
+
+
+# ====== feature selection frequency analysis (stability across folds) ======
+def _sel_items(sel, n_orig, relative=False):
+    """Normalize one selection entry to a list of (idx, norm) pairs.
+
+    relative=True divides each norm by the largest selected norm *within
+    this same fit* (after n_orig filtering), so values lie in (0, 1] and mean
+    'importance relative to the strongest feature in that model'. This makes
+    norms comparable across fits at different penalty levels, where raw
+    magnitudes differ by orders of magnitude (weak penalty -> huge norms).
+    """
+    if isinstance(sel, dict):
+        items = [(int(k), float(v)) for k, v in sel.items()]
+    else:  # backward compatibility: plain list of indices
+        items = [(int(k), np.nan) for k in sel]
+    if n_orig is not None:
+        items = [(i, v) for i, v in items if i < n_orig]
+    if relative and items:
+        mx = np.nanmax([v for _, v in items])
+        if np.isfinite(mx) and mx > 0:
+            items = [(i, v / mx) for i, v in items]
+    return items
+
+
+NORM_STATS = ("mean", "median", "min", "max")
+
+
+def _norm_summary(norms):
+    """Aggregate a feature's norms over the fits in which it was selected.
+    Returns dict with mean/std, median/iqr, min, max (NaN-safe)."""
+    a = np.asarray(norms, dtype=float)
+    a = a[np.isfinite(a)]
+    if a.size == 0:
+        return dict(norm_mean=np.nan, norm_std=np.nan, norm_median=np.nan,
+                    norm_iqr=np.nan, norm_min=np.nan, norm_max=np.nan)
+    q25, q75 = np.percentile(a, [25, 75])
+    return dict(
+        norm_mean=float(a.mean()),
+        norm_std=float(a.std(ddof=1)) if a.size > 1 else 0.0,
+        norm_median=float(np.median(a)),
+        norm_iqr=float(q75 - q25),
+        norm_min=float(a.min()),
+        norm_max=float(a.max()),
+    )
+
+
+def _norm_cols(sort_norm):
+    """(center_col, spread_col) used for display of a given statistic."""
+    if sort_norm not in NORM_STATS:
+        raise ValueError(f"sort_norm must be one of {NORM_STATS}")
+    spread = {"mean": "norm_std", "median": "norm_iqr"}.get(sort_norm)
+    return f"norm_{sort_norm}", spread
+
+
+def _build_freq_df(norms_by_idx, n_fits, feature_names, sort_norm):
+    """Shared assembly of a frequency DataFrame from {idx: [norms]}."""
+    rows = []
+    for feat_idx in sorted(norms_by_idx):
+        norms = norms_by_idx[feat_idx]
+        row = {"feature_idx": feat_idx, "count": len(norms),
+               "frequency": len(norms) / n_fits}
+        row.update(_norm_summary(norms))
+        if feature_names is not None:
+            row["feature_name"] = feature_names[feat_idx]
+        rows.append(row)
+    freq_df = pd.DataFrame(rows)
+    if len(freq_df) == 0:
+        return freq_df
+    col_order = ["feature_idx"]
+    if feature_names is not None:
+        col_order.append("feature_name")
+    col_order += ["count", "frequency", "norm_mean", "norm_std",
+                  "norm_median", "norm_iqr", "norm_min", "norm_max"]
+    center, _ = _norm_cols(sort_norm)
+    # sort by frequency, breaking ties by the chosen norm statistic
+    return (freq_df[col_order]
+            .sort_values(["count", center], ascending=[False, False])
+            .reset_index(drop=True))
+
+
+def get_feature_frequency(results, sel_col, feature_names=None, n_orig=None,
+                          sort_norm="median", relative=False):
+    """Count selection frequency and aggregate importance (L2 norm) across
+    outer folds at the CV-selected hyperparameters. `sel_col` holds dicts of
+    {feature_idx: L2_row_norm} (BiSSGL: test_sel_A / test_sel_B, SGIMC:
+    test_sel_W / test_sel_H).
+
+    n_orig    : exclude identity-augmented indices (idx >= n_orig)
+    sort_norm : which norm statistic breaks frequency ties, one of
+                'mean', 'median' (default, robust to a few huge norms),
+                'min', 'max'
+    relative  : normalize norms within each fit by that fit's largest
+                selected norm before aggregating (see _sel_items)
+
+    Returns a DataFrame sorted by count desc (ties by `sort_norm`) with
+    columns: feature_idx, [feature_name], count, frequency,
+    norm_mean, norm_std, norm_median, norm_iqr, norm_min, norm_max.
+    """
+    tpf = results["test_per_fold"]
+    if sel_col not in tpf.columns:
+        available = [c for c in tpf.columns if c.startswith("test_sel_")]
+        raise KeyError(f"Column '{sel_col}' not found in test_per_fold. "
+                       f"Available selection columns: {available}")
+
+    n_folds = len(tpf)
+    norms_by_idx = defaultdict(list)
+    for sel in tpf[sel_col]:
+        for idx, norm in _sel_items(sel, n_orig, relative=relative):
+            norms_by_idx[idx].append(norm)
+    return _build_freq_df(norms_by_idx, n_folds, feature_names, sort_norm)
+
+
+def sel_norm_matrix(results, sel_col, feature_names=None, n_orig=None,
+                    fill=np.nan):
+    """Expand a selection column into a (outer fold x feature) norm matrix.
+
+    Unlike score vectors, the test_sel_* columns hold ragged dicts
+    {feature_idx: L2_row_norm} whose keys differ per fold, so expand_scores
+    (which needs fixed-length, fixed-order vectors) cannot be used. This
+    unions the keys instead: one row per (trial, fold), one column per
+    feature ever selected, `fill` (default NaN) where a feature was not
+    selected in that fold. Use fill=0.0 to treat non-selection as zero norm.
+
+    Returns a DataFrame indexed by (trial, fold), columns sorted by
+    feature index (renamed via feature_names if given).
+    """
+    tpf = results["test_per_fold"]
+    if sel_col not in tpf.columns:
+        available = [c for c in tpf.columns if c.startswith("test_sel_")]
+        raise KeyError(f"Column '{sel_col}' not found in test_per_fold. "
+                       f"Available selection columns: {available}")
+
+    records = []
+    for sel in tpf[sel_col]:
+        if isinstance(sel, dict):
+            rec = {int(k): float(v) for k, v in sel.items()}
+        else:  # backward compatibility: plain list of indices
+            rec = {int(k): 1.0 for k in sel}
+        if n_orig is not None:
+            rec = {k: v for k, v in rec.items() if k < n_orig}
+        records.append(rec)
+
+    mat = pd.DataFrame(records,
+                       index=pd.MultiIndex.from_frame(tpf[["trial", "fold"]]))
+    mat = mat[sorted(mat.columns)]
+    if not np.isnan(fill):
+        mat = mat.fillna(fill)
+    if feature_names is not None:
+        mat.columns = [feature_names[i] for i in mat.columns]
+    return mat
+
+
+# ====== grid-pooled selection frequency (Komodromos et al. 2022 style) ======
+def _infer_hyperparam_cols(results):
+    """Recover the hyperparameter columns from results['best_params']
+    (everything that is not an id/diagnostic/score column)."""
+    skip = {"trial", "fold", "n_inner_cv"}
+    return [c for c in results["best_params"].columns
+            if c not in skip and not c.startswith("val_score")]
+
+
+def _fits_frame(results, sel_col, hyperparam_cols=None):
+    """One row per fit = (trial, fold, HP combo), with its test selection
+    dict. test_sel_* is identical across inner CV folds for the same combo
+    (like test_score), so the first inner-CV row is taken per fit."""
+    raw = results["raw"]
+    if sel_col not in raw.columns:
+        available = [c for c in raw.columns if c.startswith("test_sel_")]
+        raise KeyError(f"Column '{sel_col}' not found in raw results. "
+                       f"Available selection columns: {available}")
+    hyperparam_cols = hyperparam_cols or _infer_hyperparam_cols(results)
+    fit_cols = ["trial", "fold"] + hyperparam_cols
+    fits = (raw.groupby(fit_cols, as_index=False, sort=False)
+               .agg(**{sel_col: (sel_col, "first")}))
+    return fits, hyperparam_cols
+
+
+def get_feature_frequency_grid(results, sel_col, hyperparam_cols=None,
+                               feature_names=None, n_orig=None,
+                               sort_norm="median", relative=False):
+    """Selection frequency pooled over the full hyperparameter grid AND all
+    outer folds/trials, mirroring the 'selection proportion' of Komodromos
+    et al. (2022, Bioinformatics 38:3918), whose denominator was
+    (14 lambda values x 10 folds) = 140 fits.
+
+    Here: frequency = (# fits selecting the feature) / n_fits, where a fit
+    is one (trial, outer fold, HP combo) and n_fits = trials x folds x grid.
+
+    NORMS ACROSS THE GRID ARE A MIXTURE OF SCALES: weak-penalty fits give
+    much larger coefficients than strong-penalty fits, so the raw mean is
+    dominated by the weakest penalty. Hence sort_norm defaults to 'median';
+    relative=True (per-fit normalization) is the cleaner fix and is
+    recommended for tie-breaking / display in the pooled setting.
+
+    CAVEAT: pooling over the grid is only meaningful if selection is not
+    too sensitive to the hyperparameters (as Komodromos et al. verified for
+    lambda). Pair with get_feature_frequency() (CV-selected HP only) and
+    get_feature_frequency_by_hp() (stratified) when reporting.
+
+    Returns a DataFrame sorted by count desc (ties by `sort_norm`) with
+    columns: feature_idx, [feature_name], count, frequency,
+    norm_mean, norm_std, norm_median, norm_iqr, norm_min, norm_max.
+    """
+    fits, _ = _fits_frame(results, sel_col, hyperparam_cols)
+    n_fits = len(fits)
+    norms_by_idx = defaultdict(list)
+    for sel in fits[sel_col]:
+        for idx, norm in _sel_items(sel, n_orig, relative=relative):
+            norms_by_idx[idx].append(norm)
+    return _build_freq_df(norms_by_idx, n_fits, feature_names, sort_norm)
+
+
+def get_feature_frequency_by_hp(results, sel_col, stratify_by,
+                                hyperparam_cols=None, feature_names=None,
+                                n_orig=None, top_n=None, include_norm=False,
+                                sort_norm="median", relative=False):
+    """Selection frequency stratified by one hyperparameter: one column per
+    value of `stratify_by` (e.g. 'tilde_lambda0'), frequency computed over
+    the fits (trials x folds x remaining grid) within that stratum.
+
+    This is the honest companion to get_feature_frequency_grid() when
+    selection is hyperparameter-sensitive: consistent rows across columns
+    support a stability claim; rows that light up only at small penalties
+    reveal grid dependence that pooling would average away.
+
+    n_orig, if given, excludes identity-augmented indices (idx >= n_orig)
+    from counts and denominators, as in the other frequency functions.
+
+    Returns a DataFrame indexed by feature (name if feature_names given,
+    else index), columns = sorted values of `stratify_by`, plus a 'pooled'
+    column (and 'norm_<sort_norm>' if include_norm=True); rows sorted by
+    pooled frequency desc with ties broken by the `sort_norm` statistic of
+    the (optionally per-fit `relative`) norm when selected -- the same order
+    as get_feature_frequency_grid() with the same options -- truncated to
+    top_n.
+    """
+    fits, hyperparam_cols = _fits_frame(results, sel_col, hyperparam_cols)
+    if stratify_by not in hyperparam_cols:
+        raise KeyError(f"'{stratify_by}' is not a hyperparameter column "
+                       f"({hyperparam_cols})")
+
+    counts = defaultdict(lambda: defaultdict(int))   # idx -> stratum -> count
+    norms_by_idx = defaultdict(list)                 # idx -> pooled norms
+    n_by_stratum = defaultdict(int)
+    for stratum, sel in zip(fits[stratify_by], fits[sel_col]):
+        n_by_stratum[stratum] += 1
+        for idx, norm in _sel_items(sel, n_orig, relative=relative):
+            counts[idx][stratum] += 1
+            norms_by_idx[idx].append(norm)
+
+    center, _ = _norm_cols(sort_norm)
+    strata = sorted(n_by_stratum)
+    n_fits = sum(n_by_stratum.values())
+    rows, index = [], []
+    for feat_idx in sorted(counts):
+        by_s = counts[feat_idx]
+        row = {s: by_s.get(s, 0) / n_by_stratum[s] for s in strata}
+        row["pooled"] = sum(by_s.values()) / n_fits
+        row[center] = _norm_summary(norms_by_idx[feat_idx])[center]
+        rows.append(row)
+        index.append(feature_names[feat_idx] if feature_names is not None
+                     else feat_idx)
+
+    out = pd.DataFrame(rows, index=index, columns=strata + ["pooled", center])
+    out.index.name = "feature"
+    out = out.sort_values(["pooled", center], ascending=[False, False])
+    if not include_norm:
+        out = out.drop(columns=[center])
+    return out.head(top_n) if top_n else out
+
+
+def feature_selection_table(results, sel_col, hyperparam_cols=None,
+                            feature_names=None, n_orig=None, top_n=15,
+                            prec=2, side_label="row-side features",
+                            sort_norm="median", relative=False,
+                            caption=None, label=None, savepath=None):
+    """Publication table of the most frequently selected features, reporting
+    BOTH selection proportions side by side:
+
+      - Freq. (grid):        pooled over trials x folds x full HP grid
+                             (Komodromos et al. 2022 style; rank order)
+      - Freq. (selected HP): across outer folds at the CV-selected HP combo
+                             only (pure data-resampling stability)
+      - ||row||_2:           `sort_norm` statistic of the coefficient-row
+                             norm over the fits in which the feature was
+                             selected (grid pooling): 'median (IQR)' by
+                             default, 'mean (sd)', or a bare 'min'/'max'.
+                             relative=True reports the per-fit relative norm
+                             in (0, 1] instead of the raw magnitude.
+
+    Rows are ordered by grid frequency, ties broken by the same statistic.
+    Returns (display_df, latex_str); writes the .tex if savepath is given.
+    """
+    grid = get_feature_frequency_grid(results, sel_col, hyperparam_cols,
+                                      feature_names=feature_names,
+                                      n_orig=n_orig, sort_norm=sort_norm,
+                                      relative=relative)
+    sel = get_feature_frequency(results, sel_col,
+                                feature_names=feature_names, n_orig=n_orig,
+                                sort_norm=sort_norm, relative=relative)
+    center, spread = _norm_cols(sort_norm)
+    if len(grid) == 0:
+        raise ValueError(f"No features ever selected in '{sel_col}'.")
+
+    sel_freq = dict(zip(sel["feature_idx"], sel["frequency"])) if len(sel) \
+        else {}
+    n_fits = int(round(grid["count"].iloc[0] / grid["frequency"].iloc[0]))
+    n_outer = len(results["test_per_fold"])
+
+    top = grid.head(top_n)
+    name_col = "feature_name" if feature_names is not None else "feature_idx"
+
+    disp = pd.DataFrame({
+        "Feature": top[name_col].values,
+        "Freq. (grid)": top["frequency"].round(prec + 1).values,
+        "Freq. (selected HP)": [round(sel_freq.get(i, 0.0), prec + 1)
+                                for i in top["feature_idx"]],
+        "Norm": [_fmt(m, (s if spread else None), prec) for m, s in
+                 zip(top[center], top[spread] if spread else top[center])],
+    })
+
+    norm_head = ("$\\|A_{j\\cdot}\\|_2 / \\max_j\\|A_{j\\cdot}\\|_2$"
+                 if relative else "$\\|A_{j\\cdot}\\|_2$")
+    header = f"Feature & Freq. (grid) & Freq. (sel. HP) & {norm_head} \\\\"
+    body = []
+    for _, r in disp.iterrows():
+        feat_tex = str(r["Feature"]).replace("_", "\\_")
+        body.append(f"{feat_tex} & {r['Freq. (grid)']:.{prec}f} & "
+                    f"{r['Freq. (selected HP)']:.{prec}f} & {r['Norm']} \\\\")
+    norm_desc = {"mean": "mean (sd)", "median": "median (IQR)",
+                 "min": "minimum", "max": "maximum"}[sort_norm]
+    rel_desc = (", relative to the largest selected norm within each fit,"
+                if relative else "")
+    caption = caption or (
+        f"Most frequently selected {side_label}. Freq.\\ (grid): proportion "
+        f"of the {n_fits} fits (trials $\\times$ outer folds $\\times$ "
+        f"hyperparameter grid) selecting the feature; Freq.\\ (sel.\\ HP): "
+        f"proportion of the {n_outer} outer folds at the CV-selected "
+        f"hyperparameters; norm is the {norm_desc} coefficient-row "
+        f"$\\ell_2$ norm{rel_desc} over the fits in which the feature was "
+        f"selected."
+    )
+    latex = _booktabs([header], body, "lccc", caption,
+                      label or "tab:selection_freq")
+    if savepath:
+        with open(savepath, "w") as f:
+            f.write(latex + "\n")
+    return disp, latex
+
+
+def print_top_features(freq_df, top_n=20, label="Features"):
+    """Print the top-N most frequently selected features with importance."""
+    if len(freq_df) == 0:
+        print(f"No selected features to report for {label}.")
+        return
+    n_total = int(round(freq_df["count"].iloc[0] / freq_df["frequency"].iloc[0]))
+    print(f"\n{'=' * 70}")
+    print(f"  Top {top_n} {label}  (out of {n_total} fits)")
+    print(f"{'=' * 70}")
+    has_name = "feature_name" in freq_df.columns
+    has_norm = ("norm_median" in freq_df.columns
+                and not freq_df["norm_median"].isna().all())
+    for _, row in freq_df.head(top_n).iterrows():
+        name_str = f"  {row['feature_name']}" if has_name else ""
+        norm_str = (f"  ||r|| med={row['norm_median']:.3f} "
+                    f"[{row['norm_min']:.3f}, {row['norm_max']:.3f}]"
+                    if has_norm else "")
+        # note: iterrows() casts all-numeric rows to float, so re-int here
+        print(f"  idx {int(row['feature_idx']):>5d}{name_str:30s}  "
+              f"count={int(row['count']):>3d}  "
+              f"freq={row['frequency']:.0%}{norm_str}")
+    print(f"{'=' * 70}\n")
+
+
+# ====== figure: selection-stability heatmap (outer folds x top features) ======
+def fig_sel_heatmap(results, sel_col, top_n=30, feature_names=None, n_orig=None,
+                    method_label=None, cmap="Oranges", orient="horizontal",
+                    figsize=None, savepath=None):
+    """Heatmap of coefficient-row L2 norms across outer folds, restricted to
+    the top_n features by selection frequency (ties broken by mean norm — same
+    order as print_top_features). Empty cells = not selected in that fold.
+    Thin lines separate trials.
+
+    orient : "horizontal" -> folds on y, features on x (wide; good for few
+                             features, e.g. the drug/row side)
+             "vertical"   -> features on y, folds on x (tall; good for many
+                             features, e.g. the disease/target side)
+
+    Example
+    -------
+    fig_sel_heatmap(collected["bissgl"], "test_sel_B", top_n=40,
+                    orient="vertical", method_label="BVSIMC, disease side")
+    """
+    if orient not in ("horizontal", "vertical"):
+        raise ValueError("orient must be 'horizontal' or 'vertical'")
+
+    freq = get_feature_frequency(results, sel_col, feature_names=feature_names,
+                                 n_orig=n_orig)
+    if len(freq) == 0:
+        return None
+    name_col = "feature_name" if feature_names is not None else "feature_idx"
+    top = freq.head(top_n)
+    mat = sel_norm_matrix(results, sel_col, feature_names=feature_names,
+                          n_orig=n_orig)
+    mat = mat[top[name_col].tolist()]                # order = freq, then norm
+
+    n_folds, n_feat = mat.shape
+    trials = mat.index.get_level_values("trial").values
+    bounds = np.flatnonzero(np.diff(trials)) + 1     # trial boundaries
+    edges = np.r_[0, bounds, n_folds]
+    trial_starts = np.r_[0, bounds].astype(int)
+    fold_ticks = (edges[:-1] + edges[1:]) / 2
+    fold_labels = [f"trial {t}" for t in trials[trial_starts]]
+
+    # data grid is (fold, feature); transpose for the vertical layout
+    grid = mat.values if orient == "horizontal" else mat.values.T
+    masked = np.ma.masked_invalid(grid)
+    cbar_label = r"$\|A_{j\cdot}\|_2$ (coefficient-row norm)"
+    title = "Selected features across outer folds"
+    if method_label:
+        title += f" — {method_label}"
+    else:
+        title = None
+
+    with plt.rc_context(RC):
+        if orient == "horizontal":
+            figsize = figsize or (max(6.0, 0.22 * n_feat + 1.8),
+                                  max(3.6, 0.09 * n_folds + 1.6))
+        else:
+            figsize = figsize or (max(4.5, 0.10 * n_folds + 1.8),
+                                  max(4.0, 0.20 * n_feat + 1.6))
+        fig, ax = plt.subplots(figsize=figsize)
+        im = ax.pcolormesh(masked, cmap=cmap, edgecolors="white",
+                           linewidth=0.4, vmin=0)
+
+        if orient == "horizontal":
+            ax.invert_yaxis()                        # fold 0 at the top
+            for b in bounds:
+                ax.axhline(b, color=_INK, linewidth=0.9)
+            ax.set_yticks(fold_ticks)
+            ax.set_yticklabels(fold_labels, fontsize=9)
+            ax.set_xticks(np.arange(n_feat) + 0.5)
+            ax.set_xticklabels(mat.columns, rotation=90, fontsize=8)
+        else:                                        # vertical
+            ax.invert_yaxis()                        # top feature at the top
+            for b in bounds:
+                ax.axvline(b, color=_INK, linewidth=0.9)
+            ax.set_xticks(fold_ticks)
+            ax.set_xticklabels(fold_labels, fontsize=9, rotation=90)
+            ax.set_yticks(np.arange(n_feat) + 0.5)
+            ax.set_yticklabels(mat.columns, fontsize=8)
+
+        ax.tick_params(length=0, colors=_MUTED, labelcolor=_INK)
+        for side in ("top", "right", "left", "bottom"):
+            ax.spines[side].set_visible(False)
+        ax.set_title(title, fontsize=12, pad=10, color=_INK, loc="left")
+
+        cbar = fig.colorbar(im, ax=ax, fraction=0.035, pad=0.02)
+        cbar.set_label(cbar_label, fontsize=10)
+        cbar.outline.set_visible(False)
+
+        fig.tight_layout()
+        if savepath:
+            fig.savefig(savepath, dpi=300, bbox_inches="tight",
+                        facecolor="white")
+        return fig
+
 
 
 def make_tables(collected, savedir, methods=None, metrics=SCORE_COLS,
