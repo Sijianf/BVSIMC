@@ -660,36 +660,59 @@ def print_summary(results, method_label="Method"):
 
 
 def make_tables(collected, savedir, methods=None, metrics=SCORE_COLS,
-                include_d=True, prec=3, verbose=True):
+                include_d=True, prec=3, table_name="table_comparison",
+                caption=None, label=None, verbose=True):
     """Write the comparison table (.tex) to `savedir`.
+
+    table_name : base filename WITHOUT extension (default 'table_comparison');
+                 a trailing '.tex' is stripped if given
+    caption, label : passed to comparison_table; label defaults to
+                 'tab:<table_name>' so LaTeX \\ref names follow the filename
     Returns {"comparison": (display_df, latex_str)}."""
     os.makedirs(savedir, exist_ok=True)
+    table_name = str(table_name)
+    if table_name.endswith(".tex"):
+        table_name = table_name[:-4]
     disp, latex = comparison_table(collected, metrics=metrics, methods=methods,
-                                   include_d=include_d, prec=prec)
-    with open(os.path.join(savedir, "table_comparison.tex"), "w") as f:
+                                   include_d=include_d, prec=prec,
+                                   caption=caption,
+                                   label=label or f"tab:{table_name}")
+    path = os.path.join(savedir, f"{table_name}.tex")
+    with open(path, "w") as f:
         f.write(latex + "\n")
     if verbose:
-        print(f"Table written to {savedir}/table_comparison.tex")
+        print(f"Table written to {path}")
     return {"comparison": (disp, latex)}
 
 
 def make_figures(collected, savedir, methods=None,
                  metrics=("aupr", "auc", "f1"), ylim=None,
-                 formats=("pdf", "png"), verbose=True):
-    """Write the comparison bar figure to `savedir` in each format."""
+                 formats=("pdf", "png"), fig_name="fig_comparison",
+                 verbose=True):
+    """Write the comparison bar figure to `savedir` in each format.
+
+    fig_name : base filename WITHOUT extension (default 'fig_comparison');
+               an extension matching one of `formats` is stripped if given."""
     os.makedirs(savedir, exist_ok=True)
+    fig_name = str(fig_name)
+    root, ext = os.path.splitext(fig_name)
+    if ext.lstrip(".") in formats:
+        fig_name = root
     for ext in formats:
         fig_comparison(collected, metrics=metrics, methods=methods, ylim=ylim,
-                       savepath=os.path.join(savedir, f"fig_comparison.{ext}"))
+                       savepath=os.path.join(savedir, f"{fig_name}.{ext}"))
     plt.close("all")
     if verbose:
-        print(f"Figures written to {savedir}/ ({', '.join(formats)})")
+        print(f"Figures written to {savedir}, as {fig_name}.* "
+              f"({', '.join(formats)})")
 
 
 def make_report(collected, savedir=None, figdir=None, tabledir=None,
                 methods=None, table_metrics=SCORE_COLS,
                 fig_metrics_=("aupr", "auc", "f1"), include_d=True,
-                ylim=None, formats=("pdf", "png"), prec=3):
+                ylim=None, formats=("pdf", "png"), prec=3,
+                table_name="table_comparison", fig_name="fig_comparison",
+                caption=None, label=None, name=None):
     """Export the comparison table and figure in one call.
 
     Destinations
@@ -698,15 +721,38 @@ def make_report(collected, savedir=None, figdir=None, tabledir=None,
     - make_report(collected, figdir=..., tabledir=...)    -> separate dirs
     Explicit figdir/tabledir override savedir when both are given.
 
+    Output names
+    ------------
+    name       : shorthand suffix applied to both defaults, e.g. name="tb"
+                 -> table_comparison_tb.tex, fig_comparison_tb.pdf/png
+    table_name : full base name for the .tex (overrides `name`)
+    fig_name   : full base name for the figure files (overrides `name`)
+    caption    : custom LaTeX caption for the table
+    label      : LaTeX label (default 'tab:<table_name>')
+
+    Examples
+    --------
+    make_report(collected, savedir=OUT, name="tb_main")
+    make_report(collected, savedir=OUT, table_name="table_tb_performance",
+                fig_name="fig_tb_performance",
+                caption="Predictive performance on the tuberculosis data.",
+                label="tab:tb_performance")
+
     Returns the {name: (display_df, latex_str)} dict from make_tables.
     """
     figdir = figdir or savedir
     tabledir = tabledir or savedir
     if figdir is None or tabledir is None:
         raise ValueError("Provide savedir, or both figdir and tabledir.")
+    if name:
+        if table_name == "table_comparison":
+            table_name = f"table_comparison_{name}"
+        if fig_name == "fig_comparison":
+            fig_name = f"fig_comparison_{name}"
 
     tables = make_tables(collected, tabledir, methods=methods,
-                         metrics=table_metrics, include_d=include_d, prec=prec)
+                         metrics=table_metrics, include_d=include_d, prec=prec,
+                         table_name=table_name, caption=caption, label=label)
     make_figures(collected, figdir, methods=methods, metrics=fig_metrics_,
-                 ylim=ylim, formats=formats)
+                 ylim=ylim, formats=formats, fig_name=fig_name)
     return tables

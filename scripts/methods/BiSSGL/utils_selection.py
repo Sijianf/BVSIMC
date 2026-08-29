@@ -602,9 +602,63 @@ def _tex(s):
             .replace("%", "\\%").replace("_", "\\_").replace("#", "\\#"))
 
 
+def _prevalence_counts(feature_df):
+    """Number of entities carrying each feature = count of NON-ZERO entries
+    per column. Equals the column sum for 0/1 indicators, and stays meaningful
+    for -1/+1 or non-binary encodings (where the plain sum would be ~0)."""
+    num = feature_df.apply(pd.to_numeric, errors="coerce")
+    nonbin = [c for c in num.columns
+              if not num[c].dropna().isin([0, 1]).all()]
+    if nonbin:
+        print(f"NOTE: {len(nonbin)} feature column(s) are not 0/1 (e.g. "
+              f"{nonbin[:3]}); prevalence counts non-zero entries.")
+    return (num.fillna(0) != 0).sum(axis=0)
+
+
+def check_feature_alignment(feature_df, M, n_orig=None, atol=1e-8,
+                            name="V"):
+    """Verify that the CSV feature block equals the fitted matrix (its first
+    n_orig columns if identity-augmented). Prints a verdict and returns True
+    if aligned. Call with the matrix actually passed to the model, e.g.
+        X, Y, R = load(staged_dataset);  check_feature_alignment(prev_V, Y, 33)
+    """
+    A = np.asarray(M.todense() if hasattr(M, "todense") else M, dtype=float)
+    n_orig = n_orig or feature_df.shape[1]
+    B = feature_df.apply(pd.to_numeric, errors="coerce").fillna(0).values
+    if A.shape[0] != B.shape[0]:
+        print(f"[{name}] row mismatch: matrix has {A.shape[0]} rows, CSV has "
+              f"{B.shape[0]} entities -> different entity sets/order.")
+        return False
+    if A.shape[1] < n_orig:
+        print(f"[{name}] matrix has only {A.shape[1]} columns < n_orig={n_orig}.")
+        return False
+    A = A[:, :n_orig]
+    if B.shape[1] != n_orig:
+        print(f"[{name}] CSV has {B.shape[1]} feature columns, n_orig={n_orig}.")
+        return False
+    diff = np.abs(A - B) > atol
+    if not diff.any():
+        print(f"[{name}] aligned: CSV feature block == matrix[:, :{n_orig}].")
+        return True
+    bad_cols = np.flatnonzero(diff.any(axis=0))
+    print(f"[{name}] NOT aligned: {len(bad_cols)}/{n_orig} columns differ "
+          f"(first: {bad_cols[:8].tolist()}); names/prevalence would be wrong.")
+    # helpful hint: is it a pure column permutation?
+    try:
+        perm = [next(j for j in range(n_orig) if np.allclose(A[:, i], B[:, j],
+                                                              atol=atol))
+                for i in range(n_orig)]
+        print(f"[{name}] matrix columns map to CSV columns {perm[:10]}... "
+              "-> reorder the CSV feature block accordingly.")
+    except StopIteration:
+        pass
+    return False
+
+
 def feature_table_named(results, side, feature_names, n_orig, top_n=15,
                         prevalence=None, labels=None, sort_norm="median",
-                        relative=True, prec=2, hyperparam_cols=None):
+                        relative=True, prec=2, hyperparam_cols=None,
+                        tie_break="norm", prevalence_range=None):
     """Tidy DataFrame of the top selected features on one side, by name.
 
     Columns
@@ -616,9 +670,20 @@ def feature_table_named(results, side, feature_names, n_orig, top_n=15,
     norm          : `sort_norm` statistic of the (relative) row norm
     norm_spread   : IQR (median) / sd (mean) / NaN (min, max)
     prevalence    : if `prevalence` (entities x features DataFrame) is given,
-                    number of entities carrying the feature (column sum for
-                    binary features) -- e.g. how many drugs have the group
+                    number of entities with a non-zero value for the feature
+                    -- e.g. how many drugs carry the group
     prevalence_pct: the same as a fraction of entities
+
+    Ranking: always by freq_grid (the evidence of consistent selection),
+    then ties broken by `tie_break`:
+      'norm'            relative row norm (default; the model's effect size)
+      'prevalence'      more common features first (needs `prevalence`)
+      'prevalence_low'  rarer features first -- specific groups above
+                        near-universal ones
+    prevalence_range : optional (lo, hi) fraction bounds; features whose
+                       prevalence_pct falls outside are dropped BEFORE taking
+                       top_n (e.g. (0.05, 0.9) removes near-constant groups).
+                       State the filter in the caption if you use it.
     """
     sel_col = _side_sel_col(results, side)
     grid = get_feature_frequency_grid(results, sel_col, hyperparam_cols,
@@ -633,6 +698,24 @@ def feature_table_named(results, side, feature_names, n_orig, top_n=15,
     center, spread = _norm_cols(sort_norm)
     sel_freq = dict(zip(sel["feature_idx"], sel["frequency"])) if len(sel) else {}
 
+    if (tie_break.startswith("prevalence") or prevalence_range) \
+            and prevalence is None:
+        raise ValueError("tie_break='prevalence*' / prevalence_range need the "
+                         "`prevalence` DataFrame.")
+    if prevalence is not None:
+        counts_all = _prevalence_counts(prevalence)
+        grid["_prev"] = [float(counts_all.get(nm, np.nan))
+                         for nm in grid["feature_name"]]
+        if prevalence_range is not None:
+            lo, hi = prevalence_range
+            frac = grid["_prev"] / len(prevalence)
+            grid = grid[(frac >= lo) & (frac <= hi)]
+        if tie_break == "prevalence":
+            grid = grid.sort_values(["count", "_prev", center],
+                                    ascending=[False, False, False])
+        elif tie_break == "prevalence_low":
+            grid = grid.sort_values(["count", "_prev", center],
+                                    ascending=[False, True, False])
     top = grid.head(top_n).reset_index(drop=True)
     out = pd.DataFrame({
         "rank": np.arange(1, len(top) + 1),
@@ -645,11 +728,17 @@ def feature_table_named(results, side, feature_names, n_orig, top_n=15,
         "norm_spread": top[spread].values if spread else np.nan,
     })
     if prevalence is not None:
-        cols = [c for c in top["feature_name"] if c in prevalence.columns]
-        counts = prevalence[cols].sum(axis=0)
-        out["prevalence"] = [int(counts.get(c, 0)) if c in counts else np.nan
+        counts = _prevalence_counts(prevalence)
+        out["prevalence"] = [int(counts[c]) if c in counts.index else np.nan
                              for c in top["feature_name"]]
         out["prevalence_pct"] = out["prevalence"] / len(prevalence)
+        bad = out[(out["prevalence"] == 0) & (out["freq_grid"] > 0)]
+        if len(bad):
+            print("WARNING: selected feature(s) with zero prevalence in the CSV: "
+                  f"{list(bad['feature_raw'])}. A feature that is all-zero in V "
+                  "cannot be selected, so the CSV columns are probably not "
+                  "aligned with the fitted matrix (check n_skip / column "
+                  "order / file version with check_feature_alignment()).")
     out.attrs["n_fits"] = int(round(grid["count"].iloc[0] /
                                     grid["frequency"].iloc[0]))
     out.attrs["n_outer"] = len(results["test_per_fold"])
@@ -691,7 +780,8 @@ def feature_table_named_latex(tab, side_label, caption=None, label=None,
         f"CV-selected hyperparameters; norm: {norm_desc} coefficient-row "
         f"$\\ell_2$ norm{', relative to the largest selected norm within each fit,' if relative else ''} "
         f"over the fits in which the feature is selected"
-        + ("; prevalence: number (\\%) of entities carrying the feature."
+        + ("; prevalence: number (\\%) of entities (drugs/strains) whose "
+           "feature value is non-zero in the input data."
            if has_prev else ".")
     )
     colfmt = "rlccc" + ("c" if has_prev else "")
@@ -745,7 +835,7 @@ def feature_table_across_methods(collected, side, feature_names, n_orig,
         out[_label_for(m, collected)] = [
             float(df["frequency"].get(i, 0.0)) for i in union]
     if prevalence is not None:
-        cnt = prevalence.sum(axis=0)
+        cnt = _prevalence_counts(prevalence)
         out["prevalence"] = [int(cnt.get(feature_names[i], 0)) for i in union]
     order_cols = ([_label_for(rank_by, collected)] if rank_by in per_method
                   else []) + [_label_for(m, collected) for m in per_method
@@ -798,6 +888,7 @@ def feature_selection_report(collected, names_U, names_V, n_orig_U, n_orig_V,
                              side_labels=("strain features",
                                           "drug functional groups"),
                              sort_norm="median", relative=True, prec=2,
+                             tie_break="norm", prevalence_range=None,
                              savedir=None, verbose=True):
     """One call: named top-feature tables for both sides of `method`, the
     cross-method comparison for both sides, full-length CSVs, and .tex files.
@@ -818,7 +909,12 @@ def feature_selection_report(collected, names_U, names_V, n_orig_U, n_orig_V,
                   f"n_orig={n_orig}; names may be misaligned with indices.")
         tab = feature_table_named(res, side, names, n_orig, top_n=top_n,
                                   prevalence=prev, labels=labels,
-                                  sort_norm=sort_norm, relative=relative)
+                                  sort_norm=sort_norm, relative=relative,
+                                  tie_break=(tie_break if prev is not None
+                                             else "norm"),
+                                  prevalence_range=(prevalence_range
+                                                    if prev is not None
+                                                    else None))
         out[side] = tab
         if len(tab):
             out[side + "_tex"] = feature_table_named_latex(
@@ -829,7 +925,9 @@ def feature_selection_report(collected, names_U, names_V, n_orig_U, n_orig_V,
                 full = feature_table_named(res, side, names, n_orig,
                                            top_n=10**9, prevalence=prev,
                                            labels=labels, sort_norm=sort_norm,
-                                           relative=relative)
+                                           relative=relative,
+                                           tie_break=(tie_break if prev is not
+                                                      None else "norm"))
                 full.to_csv(os.path.join(savedir,
                             f"selection_{side}_{method}_full.csv"), index=False)
         cmp = feature_table_across_methods(collected, side, names, n_orig,
@@ -1169,7 +1267,8 @@ def make_drug_figures(tab, prevalence=None, figdir=".", top_n=8,
     t = tab.head(top_n)
     out = {}
     note = {"freq_grid": "values: selection frequency over trials x folds x HP grid",
-            "freq_selhp": "values: selection frequency over outer folds at the CV-selected HP"
+            "freq_selhp": "values: selection frequency over outer folds at the CV-selected HP",
+            "prevalence_pct": "values: prevalence percentage"
             }.get(metric, f"values: {metric}")
     try:
         fig = fig_fg_structures(t["feature_raw"], annot=t[metric], labels=labels,
