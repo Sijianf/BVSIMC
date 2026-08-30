@@ -1,0 +1,14 @@
+# ===== Ignore everything by default =====
+/*
+
+# ===== Except these =====
+!bvsimc/
+!.gitignore
+!README.md
+
+# ===== But still ignore build artifacts inside bvsimc/ =====
+bvsimc/**/__pycache__/
+bvsimc/**/*.egg-info/
+bvsimc/build/
+bvsimc/dist/
+.DS_Store
