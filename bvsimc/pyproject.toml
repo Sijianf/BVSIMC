@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bvsimc"
+version = "0.1.0"
+description = "Bayesian Variable Selection-Guided Inductive Matrix Completion"
+readme = "README.md"
+requires-python = ">=3.9"
+authors = [{name = "Sijian Fan", email = "sijianstats@gmail.com"}]
+dependencies = [
+    "numpy",
+    "scipy",
+    "scikit-learn",
+]
+
+[tool.setuptools]
+packages = ["bvsimc"]
+package-dir = {"bvsimc" = "."}
