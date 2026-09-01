@@ -6,6 +6,7 @@
 !examples/
 !.gitignore
 !README.md
+!LICENSE
 
 # ===== But still ignore build artifacts inside bvsimc/ =====
 bvsimc/**/__pycache__/

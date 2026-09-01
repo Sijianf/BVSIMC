@@ -32,7 +32,7 @@ model = BVSIMC(
     tilde_lambda0=50, tilde_lambda1=5,  # spike / slab scale, U side
 )
 
-mu, A, B, logLik = model.optimization(seed=0)
+_, A, B, logLik = model.optimization(seed=0)
 ```
 
 `A` and `B` are the fitted latent coefficient matrices — rows shrunk to all-zero were dropped by the spike-and-slab prior. Predicted probabilities are recovered via:
