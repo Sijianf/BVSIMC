@@ -1,4 +1,4 @@
-# BVSIMC: Binary Variational Spike-and-slab Inductive Matrix Completion
+# BVSIMC: Bayesian Variable Selection-Guided Inductive Matrix Completion
 # (formerly BiSSGL / BiSSGLcf.py — renamed as part of the BiSSGL -> BVSIMC project rename)
 # 2026.02: Converted from top-level functions into an encapsulated class
 # 2026.04: Updated codes for speeding up (this is the "cf" variant, verified
