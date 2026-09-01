@@ -21,4 +21,4 @@ mu, A, B, logLik = model.optimization(seed=42)
 
 ## Examples
 
-See `examples/` for simulation and real-data walkthroughs.
+See `examples/` for simulation data generation and implementation walkthroughs.
